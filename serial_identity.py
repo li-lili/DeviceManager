@@ -15,6 +15,7 @@ CMD_SN = 0x02
 CMD_PUBLIC_KEY = 0x03
 CMD_SET_SN = 0x04
 CMD_GENERATE_KEYS = 0x05
+CMD_REBOOT = 0x0A
 RESPONSE_FLAG = 0x80
 MAX_REQUEST_PAYLOAD = 2048
 # 协议文档写 2048，但 RSA-3072 OpenSSH 私钥文本约 2.5 KB，接收侧需留出余量。
@@ -152,6 +153,14 @@ class SerialIdentityReader:
             raise SerialProtocolError(f"设备 SN 无效：{error}") from error
         return SerialIdentity(sn, normalize_public_key(key_payload))
 
+    def read_public_key(self, port: str) -> str:
+        """只读设备公钥（0x03），用于写入 SN 前记录旧公钥指纹。"""
+        connection = self._open(port)
+        buffer = bytearray()
+        with connection:
+            key_payload = self._command(connection, CMD_PUBLIC_KEY, buffer)
+        return normalize_public_key(key_payload)
+
     def write_sn(self, port: str, sn: str) -> str:
         """写入 SN 并校验设备回显的 SEQ；成功后返回写入的 SN。"""
         try:
@@ -174,6 +183,13 @@ class SerialIdentityReader:
             key_payload = self._command(
                 connection, CMD_GENERATE_KEYS, bytearray(), timeout=20.0)
         return normalize_public_key(key_payload)
+
+    def reboot(self, port: str) -> None:
+        """收到成功的空应答后，确认设备已接受重启请求。"""
+        with self._open(port) as connection:
+            response = self._command(connection, CMD_REBOOT, bytearray())
+        if response:
+            raise SerialProtocolError("重启应答 Payload 应为空，重启结果未确认")
 
     def _command(self, connection, command: int, buffer: bytearray,
                  payload: bytes = b"", timeout: float | None = None) -> bytes:

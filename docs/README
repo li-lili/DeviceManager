@@ -1,0 +1,31 @@
+配置自启动：
+
+1. ubuntu系统下面创建文件: /etc/systemd/system/device-agent.service
+写入下面内容：
+[Unit]
+Description=Device Agent Service
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/opt/device-agent/device-agent
+WorkingDirectory=/opt/device-agent
+Environment=LD_LIBRARY_PATH=/opt/device-agent
+Restart=always
+RestartSec=30
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
+
+2.重新加载并启动
+sudo systemctl daemon-reload
+sudo systemctl enable device-agent.service
+sudo systemctl start device-agent.service
+
+3.查看日志
+sudo journalctl -u device-agent.service -f
+

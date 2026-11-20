@@ -14,6 +14,22 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+# Use the runtime shipped with Qt consistently; Conda's older DLLs can
+# otherwise be loaded first from the bundle root.
+from pathlib import Path
+import PySide6
+qt_dir = Path(PySide6.__file__).parent
+runtime_names = {p.name.lower() for pattern in ('msvcp140*.dll', 'vcruntime140*.dll')
+                 for p in qt_dir.glob(pattern)}
+a.binaries = [entry for entry in a.binaries
+              if Path(entry[0]).name.lower() not in runtime_names
+              and entry[0].lower() != 'ucrtbase.dll'
+              # Qt uses Windows ICU; PATH may contain incompatible third-party ICU.
+              and not Path(entry[0]).name.lower().startswith('icu')
+              and not entry[0].lower().startswith('api-ms-win-')]
+for name in sorted(runtime_names):
+    source = next(p for p in qt_dir.iterdir() if p.name.lower() == name)
+    a.binaries.append((source.name, str(source), 'BINARY'))
 pyz = PYZ(a.pure)
 
 exe = EXE(

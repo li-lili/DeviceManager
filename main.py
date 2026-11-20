@@ -1,8 +1,10 @@
 """设备公钥绑定工具：串口读取 SN 与公钥，手动提交云端绑定。"""
 
+import hashlib
 import sys
 from pathlib import Path
 
+from cryptography.hazmat.primitives import serialization
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Qt, Signal
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFormLayout, QFrame, QHBoxLayout,
@@ -191,6 +193,14 @@ STYLE = STYLE.replace(
 )
 
 
+def public_key_fingerprint(pem: str) -> str:
+    """计算公钥 SPKI DER 的 SHA-256 指纹，用于写入 SN 前后比对。"""
+    key = serialization.load_pem_public_key(pem.encode("ascii"))
+    der = key.public_bytes(
+        serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+    return hashlib.sha256(der).hexdigest()
+
+
 class SerialReadSignals(QObject):
     succeeded = Signal(object)
     failed = Signal(str)
@@ -213,7 +223,7 @@ class SerialReadTask(QRunnable):
 
 
 class SerialOperationSignals(QObject):
-    succeeded = Signal(str)
+    succeeded = Signal(object)
     failed = Signal(str)
 
 
@@ -226,12 +236,18 @@ class SerialWriteSnTask(QRunnable):
         self.signals = SerialOperationSignals()
 
     def run(self):
+        old_pem = ""
+        try:
+            old_pem = self.reader.read_public_key(self.port)
+        except (SerialProtocolError, OSError, ValueError):
+            # 设备尚无公钥（或暂时读不到）均视为“无旧密钥”。
+            old_pem = ""
         try:
             self.reader.write_sn(self.port, self.sn)
         except (SerialProtocolError, OSError, ValueError) as error:
             self.signals.failed.emit(str(error))
         else:
-            self.signals.succeeded.emit(self.sn)
+            self.signals.succeeded.emit((self.sn, old_pem))
 
 
 class SerialGenerateKeysTask(QRunnable):
@@ -244,10 +260,23 @@ class SerialGenerateKeysTask(QRunnable):
     def run(self):
         try:
             public_key_pem = self.reader.generate_keys(self.port)
+            identity = self.reader.read_identity(self.port)
+            if public_key_fingerprint(identity.public_key_pem) != public_key_fingerprint(public_key_pem):
+                raise SerialProtocolError("生成后读回的公钥不一致，请重试")
         except (SerialProtocolError, OSError, ValueError) as error:
             self.signals.failed.emit(str(error))
         else:
-            self.signals.succeeded.emit(public_key_pem)
+            self.signals.succeeded.emit((identity.sn, public_key_pem))
+
+
+class SerialRebootTask(SerialGenerateKeysTask):
+    def run(self):
+        try:
+            self.reader.reboot(self.port)
+        except (SerialProtocolError, OSError, ValueError) as error:
+            self.signals.failed.emit(str(error))
+        else:
+            self.signals.succeeded.emit(None)
 
 
 class DeviceManager(QWidget):
@@ -266,6 +295,10 @@ class DeviceManager(QWidget):
         self.serial_task = None
         self.pending_port = ""
         self.binding_identity = None
+        self.cloud_pending = False
+        self.reboot_pending = False
+        self.rotation_pending = False
+        self.rotation_old_fingerprint = ""
         self.binding_client = BindingClient(self)
         self.binding_client.completed.connect(self.binding_finished)
 
@@ -280,6 +313,10 @@ class DeviceManager(QWidget):
         self.write_sn_button.setObjectName("secondary")
         self.gen_keys_button = QPushButton("生成并写入密钥")
         self.gen_keys_button.setObjectName("secondary")
+        self.reboot_button = QPushButton("重启开发板")
+        self.reboot_button.setObjectName("primary")
+        self.reboot_button.setEnabled(False)
+        self.reboot_button.clicked.connect(self.reboot_device)
         self.bind_sn = QLineEdit()
         self.bind_sn.setReadOnly(True)
         self.bind_sn.setPlaceholderText("读取后显示设备 SN")
@@ -386,8 +423,9 @@ class DeviceManager(QWidget):
         row.setSpacing(8)
         row.addWidget(self.write_sn_button)
         row.addWidget(self.gen_keys_button)
+        row.addWidget(self.reboot_button)
         layout.addLayout(row)
-        hint = QLabel("写入 0x04 · 生成密钥 0x05    私钥在设备内生成，不会通过串口发送")
+        hint = QLabel("写入 SN → 生成密钥 → 提交云端 → 重启开发板，按顺序完成")
         hint.setObjectName("hint")
         layout.addWidget(hint)
         return card
@@ -485,7 +523,9 @@ class DeviceManager(QWidget):
         answer = QMessageBox.question(
             self, "确认写入 SN",
             f"将把设备 SN 改写为：\n\n{sn}\n\n"
-            "该操作会写入设备存储，请确认设备型号与序列号正确。",
+            "该操作会写入设备存储，请确认设备型号与序列号正确。\n\n"
+            "写入成功后界面将锁定，必须点击“生成并写入密钥”\n"
+            "生成配套新密钥后才能继续读取或提交绑定。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
         if answer != QMessageBox.StandardButton.Yes:
@@ -509,7 +549,8 @@ class DeviceManager(QWidget):
             "将在设备上生成 RSA-2048 密钥对：\n\n"
             "• 私钥写入设备 Vendor Storage，不会通过串口发送\n"
             "• 公钥返回并更新到“身份信息”\n\n"
-            "如果设备已有完整密钥对，将直接返回现有公钥，不会重新生成。",
+            "如果设备已有完整密钥对，将直接返回现有公钥，不会重新生成；\n"
+            "写入 SN 后的强制流程会校验公钥确已更换，未更换则禁止提交绑定。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
         if answer != QMessageBox.StandardButton.Yes:
@@ -523,30 +564,32 @@ class DeviceManager(QWidget):
         self.serial_task = task
         self.serial_pool.start(task)
 
-    def write_sn_finished(self, sn):
+    def write_sn_finished(self, payload):
+        sn, old_pem = payload
         self.serial_task = None
-        key_text = (self.binding_identity.public_key if self.binding_identity
-                    else self.bind_public_key.toPlainText().strip())
-        if key_text:
-            source = f"串口 {self.pending_port}"
-            try:
-                self.set_binding_identity(BindingIdentity(sn, key_text, source, source))
-            except ValueError as error:
-                self.bind_sn.setText(sn)
-                self.set_controls_enabled(True)
-                self._set_status(f"SN 已写入，但身份校验失败：{error}", "error")
-                return
-            self.set_controls_enabled(True)
-            self._set_status(f"SN 已写入并读回校验：{sn}，请核对后提交绑定", "success")
-        else:
-            self.bind_sn.setText(sn)
-            self.set_controls_enabled(True)
-            self._set_status(f"SN 已写入并读回校验：{sn}；请读取公钥后再提交绑定", "success")
+        self.rotation_old_fingerprint = public_key_fingerprint(old_pem) if old_pem else ""
+        self.rotation_pending = True
+        self.bind_sn.setText(sn)
+        self.bind_response.clear()
+        self._apply_rotation_lock()
+        self._set_status(
+            f"SN 已写入：{sn}。必须点击“生成并写入密钥”生成配套新密钥，"
+            "完成前界面锁定；旧公钥直接提交云端会因指纹冲突被拒绝", "error")
 
-    def generate_keys_finished(self, public_key_pem):
+    def generate_keys_finished(self, payload):
+        sn, public_key_pem = payload
         self.serial_task = None
-        sn = (self.binding_identity.sn if self.binding_identity
-              else self.bind_sn.text().strip())
+        self.cloud_pending = True
+        if self.rotation_pending:
+            new_fingerprint = public_key_fingerprint(public_key_pem)
+            if self.rotation_old_fingerprint and new_fingerprint == self.rotation_old_fingerprint:
+                self._set_status(
+                    "设备返回的仍是写入 SN 前的旧公钥，未重新生成；该公钥可能已绑定其他 SN，"
+                    "禁止提交绑定。请重试生成，持续失败需固件支持强制重置密钥", "error")
+                self._apply_rotation_lock()
+                return
+            self.rotation_pending = False
+            self.rotation_old_fingerprint = ""
         if sn:
             source = f"串口 {self.pending_port}"
             try:
@@ -557,7 +600,7 @@ class DeviceManager(QWidget):
                 self._set_status(f"密钥已生成，但身份校验失败：{error}", "error")
                 return
             self.set_controls_enabled(True)
-            self._set_status("密钥已生成并写入设备，请核对后提交绑定", "success")
+            self._set_status("密钥已生成并写入设备，必须提交云端，成功后必须重启开发板", "success")
         else:
             self.bind_public_key.setPlainText(public_key_pem)
             self.set_controls_enabled(True)
@@ -565,8 +608,25 @@ class DeviceManager(QWidget):
 
     def operation_failed(self, message):
         self.serial_task = None
+        if self.rotation_pending:
+            self._set_status(
+                f"操作失败：{message}。SN 已写入，仍必须点击“生成并写入密钥”完成配套", "error")
+            self._apply_rotation_lock()
+            return
         self.set_controls_enabled(True)
         self._set_status(f"操作失败：{message}", "error")
+
+    def _apply_rotation_lock(self):
+        """写入 SN 后锁定界面，仅保留“生成并写入密钥”可点击。"""
+        self.reboot_button.setEnabled(False)
+        self.port_combo.setEnabled(False)
+        self.port_refresh.setEnabled(False)
+        self.sn_input.setEnabled(False)
+        self.read_button.setEnabled(False)
+        self.write_sn_button.setEnabled(False)
+        self.gen_keys_button.setEnabled(True)
+        self.bind_server.setEnabled(False)
+        self.bind_button.setEnabled(False)
 
     def set_controls_enabled(self, enabled):
         has_port = self.port_combo.count() > 0
@@ -578,6 +638,19 @@ class DeviceManager(QWidget):
         self.gen_keys_button.setEnabled(enabled and has_port)
         self.bind_server.setEnabled(enabled)
         self.bind_button.setEnabled(enabled and self.binding_identity is not None)
+        self.reboot_button.setEnabled(enabled and self.reboot_pending)
+        if enabled and self.rotation_pending:
+            self._apply_rotation_lock()
+        elif enabled and (self.cloud_pending or self.reboot_pending):
+            self.port_combo.setEnabled(False)
+            self.port_refresh.setEnabled(False)
+            self.sn_input.setEnabled(False)
+            self.read_button.setEnabled(False)
+            self.write_sn_button.setEnabled(False)
+            self.gen_keys_button.setEnabled(False)
+            self.bind_button.setEnabled(self.cloud_pending and self.binding_identity is not None)
+            self.bind_server.setEnabled(self.cloud_pending)
+
 
     def set_binding_identity(self, identity):
         identity.payload()  # Validate before changing any selected field.
@@ -610,7 +683,46 @@ class DeviceManager(QWidget):
         code = f"HTTP {result.http_status}" if result.http_status is not None else "无 HTTP 响应"
         self._set_status(f"{code}：{result.message}", "success" if result.success else "error")
         self.bind_response.setPlainText(result.display_details(include_raw=False))
+        if result.success and self.cloud_pending:
+            self.cloud_pending = False
+            self.reboot_pending = True
+            self._set_status("云端提交成功，必须重启开发板才能完成流程", "info")
         self.set_controls_enabled(True)
+        if self.reboot_pending:
+            QMessageBox.information(self, "必须重启开发板", "云端提交成功，请点击“重启开发板”完成流程。")
+
+    def reboot_device(self):
+        if not self.reboot_pending or self.serial_task is not None:
+            return
+        answer = QMessageBox.question(
+            self, "确认重启开发板", "云端提交成功，是否现在重启开发板？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.set_controls_enabled(False)
+        self._set_status("正在请求开发板重启…", "info")
+        task = SerialRebootTask(self.pending_port, self.serial_reader)
+        task.signals.succeeded.connect(self.reboot_finished)
+        task.signals.failed.connect(self.operation_failed)
+        self.serial_task = task
+        self.serial_pool.start(task)
+
+    def reboot_finished(self, _payload):
+        self.serial_task = None
+        self.reboot_pending = False
+        self.binding_identity = None
+        self.bind_sn.clear()
+        self.bind_public_key.clear()
+        self.set_controls_enabled(True)
+        self._set_status("开发板已接受重启请求；请等待启动完成后重新读取设备", "success")
+
+    def closeEvent(self, event):
+        if self.rotation_pending or self.cloud_pending or self.reboot_pending or self.serial_task is not None:
+            QMessageBox.warning(self, "流程尚未完成", "请完成密钥更新、云端提交和开发板重启后再关闭。")
+            event.ignore()
+            return
+        super().closeEvent(event)
 
 
 if __name__ == "__main__":
